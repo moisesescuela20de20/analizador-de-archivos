@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Analizador de Archivos</title>
+<link rel="icon" href="data:,"> <!-- ícono vacío: evita que el navegador pida favicon.ico y marque un error -->
+<style>
+  /* Paleta oscura minimalista */
+  :root {
+    --fondo: #09090b; --panel: #121215; --borde: #27272a;
+    --texto: #f4f4f5; --gris: #a1a1aa;
+    --verde: #10b981; --ambar: #f59e0b; --rojo: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--fondo); color: var(--texto); font-family: system-ui, sans-serif; padding: 2rem 1rem; }
+  main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 1rem; }
+  h1 { font-size: 1.3rem; }
+  a { color: var(--texto); }
+
+  .panel { background: var(--panel); border: 1px solid var(--borde); border-radius: 10px; padding: 1rem; }
+  .fila { display: flex; gap: .6rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+  .chico { font-size: .8rem; color: var(--gris); line-height: 1.5; }
+  .mono { font-family: Consolas, monospace; }
+
+  input { flex: 1; min-width: 220px; background: var(--fondo); color: var(--texto);
+          border: 1px solid var(--borde); border-radius: 6px; padding: .5rem; font-family: Consolas, monospace; }
+
+  button { background: var(--panel); color: var(--gris); border: 1px solid var(--borde);
+           border-radius: 6px; padding: .35rem .7rem; cursor: pointer; }
+  button:hover { color: var(--texto); }
+  .nombre { margin-right: auto; } /* empuja el tamaño y el botón Cancelar a la derecha */
+
+  .zona { border: 2px dashed var(--borde); text-align: center; padding: 2.5rem 1rem; cursor: pointer; }
+  .zona:hover, .zona.encima { border-color: var(--gris); }
+
+  .error-global { border-color: var(--rojo); color: var(--rojo); }
+  .estado { font-family: Consolas, monospace; font-size: .8rem; margin-top: .4rem; }
+  .esperando { color: var(--ambar); }
+  .limpio { color: var(--verde); }
+  .peligro { color: var(--rojo); }
+  .informe { margin-top: .4rem; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <h1>Analizador de Archivos</h1>
+    <p class="chico">Analizá varios archivos en VirusTotal de una sola vez y mirá el informe de cada uno.</p>
+  </div>
+
+  <!-- Aviso si se abrió el HTML con doble clic en vez de pasar por el proxy -->
+  <div id="aviso-file" class="panel error-global" hidden>
+    Abriste el archivo directamente. Ejecutá <span class="mono">python proxy.py</span> y entrá a
+    <span class="mono">http://localhost:8000</span>; si no, el navegador bloquea las llamadas a VirusTotal.
+  </div>
+
+  <!-- API key: se guarda solo en este navegador -->
+  <div class="panel">
+    <div class="fila">
+      <input id="clave" type="password" placeholder="Pegá tu API key de VirusTotal" autocomplete="off">
+      <span id="uso" class="chico mono"></span>
+    </div>
+    <p class="chico" style="margin-top:.5rem">
+      API pública gratuita: 4 peticiones por minuto y 500 por día. La app espera 15 s entre peticiones para no pasarse.
+    </p>
+  </div>
+
+  <!-- Zona para arrastrar o elegir archivos -->
+  <input id="selector" type="file" multiple hidden>
+  <div id="zona" class="panel zona" tabindex="0">
+    <p><strong>Arrastrá tus archivos acá</strong> o hacé clic para elegirlos</p>
+    <p class="chico" style="margin-top:.6rem">
+      Máximo 32 MB por archivo. <strong>No subas archivos privados:</strong> lo que se sube a VirusTotal
+      queda disponible para la comunidad de seguridad. Si VirusTotal ya conoce el archivo, se usa ese informe sin subirlo.
+    </p>
+  </div>
+
+  <!-- Acá aparece una tarjeta por archivo (los informes terminados quedan guardados) -->
+  <div class="fila">
+    <span class="chico">Informes</span>
+    <button id="borrar" type="button">Borrar historial</button>
+  </div>
+  <div id="lista" style="display:flex; flex-direction:column; gap:.6rem"></div>
+</main>
+
+<script>
+// ================== CONFIGURACIÓN ==================
+// El puente hacia VirusTotal: en tu PC es proxy.py; publicada, es tu Worker de Cloudflare (worker.js)
+const PUENTE_PUBLICADO = 'https://TU-WORKER.workers.dev'; // ← pegá acá el link de tu Worker
+const EN_MI_PC = ['localhost', '127.0.0.1'].includes(location.hostname);
+const API = (EN_MI_PC ? '' : PUENTE_PUBLICADO) + '/api/v3';
+const PAUSA_MS = 15500;         // 4 peticiones/min = 1 cada 15 s (+0,5 s de margen)
+const LIMITE_DIARIO = 500;      // cuota diaria de la API pública
+const LIMITE_BYTES = 32 * 1024 * 1024;
+const MAX_CONSULTAS = 20;       // veces que preguntamos "¿ya terminó?" (~5 min por archivo)
+const ESPERA_429_MS = 60000;    // si igual nos frenan (error 429), esperamos 1 minuto
+
+// ================== ESTADO ==================
+const cola = [];                // archivos esperando su turno
+let procesando = false;         // evita correr dos colas a la vez
+let ultimaPeticion = 0;         // hora de la última llamada a la API
+let terminados = 0;             // para el aviso final
+
+const $ = (id) => document.getElementById(id);
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+
+if (location.protocol === 'file:' && PUENTE_PUBLICADO.includes('TU-WORKER')) $('aviso-file').hidden = false;
+
+// ================== API KEY (guardada en este navegador) ==================
+try { $('clave').value = localStorage.getItem('vt_clave') || ''; } catch {}
+$('clave').addEventListener('change', () => {
+  try { localStorage.setItem('vt_clave', $('clave').value.trim()); } catch {}
+});
+
+// ================== CONTADOR DIARIO ==================
+// VirusTotal reinicia la cuota a las 00:00 UTC, así que contamos por día UTC.
+const hoyUTC = () => new Date().toISOString().slice(0, 10);
+
+function leerUso() {
+  try {
+    const u = JSON.parse(localStorage.getItem('vt_uso'));
+    return u && u.dia === hoyUTC() ? u.n : 0;
+  } catch { return 0; }
+}
+function sumarUso() {
+  try { localStorage.setItem('vt_uso', JSON.stringify({ dia: hoyUTC(), n: leerUso() + 1 })); } catch {}
+  mostrarUso();
+}
+function mostrarUso() { $('uso').textContent = `${leerUso()} / ${LIMITE_DIARIO} hoy`; }
+mostrarUso();
+
+// ================== ÚNICA PUERTA HACIA LA API ==================
+// Toda llamada pasa por acá: así el ritmo de 1 cada 15 s se cumple siempre.
+function errorFatal(msg) { const e = new Error(msg); e.fatal = true; return e; }
+
+async function vt(ruta, opciones = {}) {
+  for (let intento = 1; intento <= 3; intento++) {
+    if (leerUso() >= LIMITE_DIARIO) throw errorFatal('Cuota diaria agotada (500). Se renueva a las 21:00 hora argentina.');
+
+    // Esperar lo que falte para cumplir la pausa
+    const falta = ultimaPeticion + PAUSA_MS - Date.now();
+    if (falta > 0) await esperar(falta);
+    // Si lo cancelaron mientras esperaba, no gastamos la petición
+    if (opciones.signal && opciones.signal.aborted) throw new Error('Cancelado');
+    ultimaPeticion = Date.now();
+    sumarUso();
+
+    let resp;
+    try {
+      resp = await fetch(API + ruta, { ...opciones, headers: { 'x-apikey': $('clave').value.trim() } });
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('Cancelado'); // lo cortó el botón Cancelar
+      throw errorFatal(EN_MI_PC ? 'No hay conexión con proxy.py. ¿Está abierto?'
+                                : 'No hay conexión con el puente. ¿Pegaste bien el link del Worker?');
+    }
+
+    if (resp.status === 401) throw errorFatal('API key inválida. Revisala.');
+    if (resp.status !== 429) return resp;
+    await esperar(ESPERA_429_MS); // nos frenaron: esperar y reintentar
+  }
+  throw errorFatal('VirusTotal sigue rechazando por límite (429). Probá más tarde.');
+}
+
+// Arma un mensaje de error legible a partir de la respuesta de VirusTotal
+async function errorDe(resp) {
+  try { return new Error((await resp.json()).error.message); }
+  catch { return new Error(`Error HTTP ${resp.status}`); }
+}
+
+// ================== ANÁLISIS DE UN ARCHIVO ==================
+async function sha256(file) {
+  const huella = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+  return [...new Uint8Array(huella)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function analizar(item) {
+  // La "señal" deja que el botón Cancelar corte las peticiones de este archivo
+  const signal = item.control.signal;
+
+  // 1) Huella local: identifica al archivo sin subirlo
+  estado(item, 'Calculando SHA-256…');
+  item.hash = await sha256(item.file);
+
+  // 2) ¿VirusTotal ya lo conoce? Ahorra la subida y no comparte el archivo
+  estado(item, 'Buscando informe existente…');
+  let resp = await vt('/files/' + item.hash, { signal });
+  if (!resp.ok) throw await errorDe(resp);
+  const busqueda = await resp.json();
+  if (busqueda.data) {
+    const a = busqueda.data.attributes;
+    return informe(item, a.last_analysis_stats, a.last_analysis_results, 'informe existente');
+  }
+  // Sin "data" = VirusTotal no lo conoce (proxy.py convierte ese 404 en 200 para no ensuciar la consola)
+  if (busqueda.error && busqueda.error.code !== 'NotFoundError') throw new Error(busqueda.error.message);
+
+  // 3) No lo conoce: subirlo
+  estado(item, 'Subiendo…');
+  const datos = new FormData();
+  datos.append('file', item.file);
+  resp = await vt('/files', { method: 'POST', body: datos, signal });
+  if (!resp.ok) throw await errorDe(resp);
+  const idAnalisis = (await resp.json()).data.id;
+
+  // 4) Preguntar cada 15 s si el análisis terminó
+  for (let i = 1; i <= MAX_CONSULTAS; i++) {
+    estado(item, `Analizando… (consulta ${i})`);
+    resp = await vt('/analyses/' + idAnalisis, { signal });
+    if (!resp.ok) throw await errorDe(resp);
+    const a = (await resp.json()).data.attributes;
+    if (a.status === 'completed') return informe(item, a.stats, a.results, 'análisis nuevo');
+  }
+  throw new Error('El análisis tarda demasiado. Miralo más tarde en VirusTotal.');
+}
+
+// ================== COLA ==================
+async function procesarCola() {
+  if (procesando) return;
+  procesando = true;
+  terminados = 0;
+
+  while (cola.length) {
+    const item = cola.shift();
+    try {
+      await analizar(item);
+    } catch (e) {
+      if (item.control.signal.aborted) {
+        estado(item, 'Cancelado', 'peligro');
+      } else {
+        estado(item, '✖ ' + e.message, 'peligro');
+        if (e.fatal) { // sin key, sin proxy o sin cuota: no tiene sentido seguir
+          cola.splice(0).forEach((x) => { estado(x, 'Cancelado', 'peligro'); sacarBotonCancelar(x); });
+        }
+      }
+    }
+    sacarBotonCancelar(item);
+    terminados++;
+  }
+
+  procesando = false;
+  avisarFin();
+}
+
+function agregar(archivos) {
+  if (!$('clave').value.trim()) { alert('Primero pegá tu API key.'); return; }
+  pedirPermisoNotificacion();
+
+  for (const file of archivos) {
+    const item = { file, tarjeta: crearTarjeta(file.name, file.size), control: new AbortController() };
+    if (file.size > LIMITE_BYTES) { estado(item, '✖ Supera 32 MB', 'peligro'); continue; }
+    agregarBotonCancelar(item);
+    cola.push(item);
+  }
+  procesarCola();
+}
+
+// ================== CANCELAR UN ARCHIVO ==================
+function cancelar(item) {
+  item.control.abort();                 // corta la petición en curso, si la hay
+  const i = cola.indexOf(item);
+  if (i !== -1) cola.splice(i, 1);      // si todavía esperaba su turno, lo saca de la cola
+  estado(item, 'Cancelado', 'peligro');
+  sacarBotonCancelar(item);
+}
+
+function agregarBotonCancelar(item) {
+  const boton = document.createElement('button');
+  boton.type = 'button';
+  boton.className = 'cancelar';
+  boton.textContent = 'Cancelar';
+  boton.addEventListener('click', () => cancelar(item));
+  item.tarjeta.querySelector('.fila').appendChild(boton);
+}
+
+function sacarBotonCancelar(item) {
+  const boton = item.tarjeta.querySelector('.cancelar');
+  if (boton) boton.remove();
+}
+
+// ================== INTERFAZ ==================
+function crearTarjeta(nombre, bytes) {
+  const t = document.createElement('div');
+  t.className = 'panel';
+  // Solo texto fijo en innerHTML; los datos del usuario van con textContent (evita inyección de HTML)
+  t.innerHTML = '<div class="fila"><strong class="nombre"></strong><span class="chico mono tam"></span></div>' +
+                '<div class="estado esperando">En cola</div><div class="informe chico"></div>';
+  t.querySelector('.nombre').textContent = nombre;
+  t.querySelector('.tam').textContent = (bytes / 1024 / 1024).toFixed(2) + ' MB';
+  $('lista').appendChild(t);
+  return t;
+}
+
+function estado(item, texto, clase = 'esperando') {
+  // Un archivo cancelado no vuelve a mostrar "Analizando…" ni otros pasos
+  if (item.control && item.control.signal.aborted && texto !== 'Cancelado') return;
+  const e = item.tarjeta.querySelector('.estado');
+  e.textContent = texto;
+  e.className = 'estado ' + clase;
+}
+
+// Convierte la respuesta de la API en un informe simple, lo dibuja y lo guarda
+function informe(item, stats = {}, resultados = {}, origen) {
+  const malos = stats.malicious || 0, sospechosos = stats.suspicious || 0;
+  const total = malos + sospechosos + (stats.undetected || 0) + (stats.harmless || 0);
+  const peligroso = malos + sospechosos > 0;
+
+  const datos = {
+    nombre: item.file.name,
+    bytes: item.file.size,
+    hash: item.hash,
+    peligroso,
+    texto: peligroso
+      ? `⚠ ${malos} malicioso / ${sospechosos} sospechoso de ${total} motores`
+      : `✔ Limpio: 0 detecciones de ${total} motores`,
+    // Qué motores lo detectaron y con qué nombre
+    detecciones: Object.entries(resultados)
+      .filter(([, r]) => r.category === 'malicious' || r.category === 'suspicious')
+      .map(([motor, r]) => `${motor}: ${r.result}`),
+    origen
+  };
+
+  dibujarInforme(item.tarjeta, datos);
+  guardarEnHistorial(datos);
+}
+
+function dibujarInforme(tarjeta, datos) {
+  const e = tarjeta.querySelector('.estado');
+  e.textContent = datos.texto;
+  e.className = 'estado ' + (datos.peligroso ? 'peligro' : 'limpio');
+
+  const caja = tarjeta.querySelector('.informe');
+  if (datos.detecciones.length) caja.append(datos.detecciones.join(' · '), document.createElement('br'));
+
+  // Enlace al informe completo en la web de VirusTotal
+  const enlace = document.createElement('a');
+  enlace.href = 'https://www.virustotal.com/gui/file/' + datos.hash;
+  enlace.target = '_blank';
+  enlace.rel = 'noopener';
+  enlace.textContent = `Ver informe completo (${datos.origen})`;
+  caja.append(enlace);
+  tarjeta.dataset.terminada = 'si'; // para poder borrarla con "Borrar historial"
+}
+
+// ================== HISTORIAL (se guarda en este navegador) ==================
+function leerHistorial() {
+  try { return JSON.parse(localStorage.getItem('vt_historial')) || []; } catch { return []; }
+}
+
+function guardarEnHistorial(datos) {
+  const historial = leerHistorial();
+  historial.push(datos);
+  // Guardamos los últimos 200 para no llenar el espacio del navegador
+  try { localStorage.setItem('vt_historial', JSON.stringify(historial.slice(-200))); } catch {}
+}
+
+function borrarHistorial() {
+  try { localStorage.removeItem('vt_historial'); } catch {}
+  document.querySelectorAll('[data-terminada]').forEach((t) => t.remove());
+}
+
+// Al abrir la página, volver a mostrar los informes guardados
+leerHistorial().forEach((d) => dibujarInforme(crearTarjeta(d.nombre, d.bytes), d));
+$('borrar').addEventListener('click', borrarHistorial);
+
+// ================== AVISO AL TERMINAR (extra) ==================
+function pedirPermisoNotificacion() {
+  if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+}
+
+function avisarFin() {
+  // Pitido corto
+  try {
+    const ctx = new AudioContext(), osc = ctx.createOscillator();
+    osc.connect(ctx.destination);
+    osc.frequency.value = 880;
+    osc.start(); osc.stop(ctx.currentTime + 0.3);
+  } catch {}
+  // Notificación del sistema (sirve con la pestaña en segundo plano)
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('Analizador de Archivos', { body: `Cola terminada: ${terminados} archivo(s).` });
+  }
+}
+
+// ================== ARRASTRAR Y SOLTAR ==================
+const zona = $('zona');
+zona.addEventListener('click', () => $('selector').click());
+zona.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') $('selector').click(); });
+$('selector').addEventListener('change', (e) => { agregar(e.target.files); e.target.value = ''; });
+
+zona.addEventListener('dragover', (e) => { e.preventDefault(); zona.classList.add('encima'); });
+zona.addEventListener('dragleave', () => zona.classList.remove('encima'));
+zona.addEventListener('drop', (e) => {
+  e.preventDefault();
+  zona.classList.remove('encima');
+  agregar(e.dataTransfer.files);
+});
+</script>
+</body>
+</html>
