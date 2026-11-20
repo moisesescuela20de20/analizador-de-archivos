@@ -87,7 +87,7 @@
 <script>
 // ================== CONFIGURACIÓN ==================
 // El puente hacia VirusTotal: en tu PC es proxy.py; publicada, es tu Worker de Cloudflare (worker.js)
-const PUENTE_PUBLICADO = 'https://TU-WORKER.workers.dev'; // ← pegá acá el link de tu Worker
+const PUENTE_PUBLICADO = 'https://analizador-puente.moisesescuela20de20.workers.dev'; // ← pegá acá el link de tu Worker
 const EN_MI_PC = ['localhost', '127.0.0.1'].includes(location.hostname);
 const API = (EN_MI_PC ? '' : PUENTE_PUBLICADO) + '/api/v3';
 const PAUSA_MS = 15500;         // 4 peticiones/min = 1 cada 15 s (+0,5 s de margen)
